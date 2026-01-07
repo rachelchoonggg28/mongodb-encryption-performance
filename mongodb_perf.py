@@ -1,5 +1,7 @@
 import time
 import base64
+import os
+import psutil
 import pandas as pd
 from pymongo import MongoClient
 
@@ -14,6 +16,56 @@ from Crypto.Random import get_random_bytes
 client = MongoClient("mongodb://127.0.0.1:27017/", serverSelectionTimeoutMS=5000)
 db = client["perf_test"]
 collection = db["records"]
+
+
+# =======================
+# Process Monitor (CPU/RAM)
+# =======================
+PROC = psutil.Process(os.getpid())
+
+def _cpu_time_seconds() -> float:
+    # total CPU time used by this Python process
+    ct = PROC.cpu_times()
+    return float(ct.user + ct.system)
+
+def _rss_bytes() -> int:
+    # resident memory (RAM) used by this Python process
+    return int(PROC.memory_info().rss)
+
+def measure_stage(fn, *args, warmup_sec: float = 0.05):
+    """
+    Run fn(*args) and measure:
+    - wall_time_s
+    - cpu_time_s (process CPU time)
+    - cpu_util_pct (cpu_time / wall_time * 100; can exceed 100 on multi-core)
+    - rss_delta_mb (end_rss - start_rss)
+    Returns: (fn_result, metrics_dict)
+    """
+    # small warmup to stabilize percent sampling/OS scheduling
+    time.sleep(warmup_sec)
+
+    cpu0 = _cpu_time_seconds()
+    mem0 = _rss_bytes()
+    t0 = time.perf_counter()
+
+    result = fn(*args)
+
+    t1 = time.perf_counter()
+    cpu1 = _cpu_time_seconds()
+    mem1 = _rss_bytes()
+
+    wall = t1 - t0
+    cpu = cpu1 - cpu0
+    cpu_util = (cpu / wall * 100.0) if wall > 0 else 0.0
+    rss_delta_mb = (mem1 - mem0) / (1024 * 1024)
+
+    metrics = {
+        "wall_time_s": wall,
+        "cpu_time_s": cpu,
+        "cpu_util_pct": cpu_util,
+        "rss_delta_mb": rss_delta_mb,
+    }
+    return result, metrics
 
 
 # =======================
@@ -127,19 +179,43 @@ def query_decrypt_time(dec, N=800):
 def run_config(label, enc, dec, repeats=3):
     rows = []
     for r in range(repeats):
-        enc_t, dec_t = crypto_time(enc, dec)
-        ins_t = insert_data(enc)
+
+        # --- Crypto stage (CPU/RAM measured) ---
+        (enc_dec_times, crypto_m) = measure_stage(lambda: crypto_time(enc, dec))
+        enc_t, dec_t = enc_dec_times
+
+        # --- Insert stage (CPU/RAM measured) ---
+        (ins_t, insert_m) = measure_stage(lambda: insert_data(enc))
+
+        # --- Storage stage (fast, no need CPU/RAM) ---
         stor = storage_mb()
-        q_t = query_decrypt_time(dec)
+
+        # --- Query+Decrypt stage (CPU/RAM measured) ---
+        (q_t, query_m) = measure_stage(lambda: query_decrypt_time(dec))
 
         rows.append({
             "config": label,
             "repeat": r + 1,
+
+            # existing metrics
             "enc_time_s": enc_t,
             "dec_time_s": dec_t,
             "insert_time_s": ins_t,
             "query+decrypt_time_s": q_t,
-            "storage_mb": stor
+            "storage_mb": stor,
+
+            # NEW: CPU/RAM metrics per stage
+            "crypto_cpu_time_s": crypto_m["cpu_time_s"],
+            "crypto_cpu_util_pct": crypto_m["cpu_util_pct"],
+            "crypto_rss_delta_mb": crypto_m["rss_delta_mb"],
+
+            "insert_cpu_time_s": insert_m["cpu_time_s"],
+            "insert_cpu_util_pct": insert_m["cpu_util_pct"],
+            "insert_rss_delta_mb": insert_m["rss_delta_mb"],
+
+            "query_cpu_time_s": query_m["cpu_time_s"],
+            "query_cpu_util_pct": query_m["cpu_util_pct"],
+            "query_rss_delta_mb": query_m["rss_delta_mb"],
         })
     return rows
 
@@ -166,15 +242,27 @@ def main():
     df = pd.DataFrame(all_rows)
     summary = df.groupby("config").mean(numeric_only=True).reset_index()
 
+    # OPTIONAL: compute overhead vs plaintext (mean)
+    base = summary[summary["config"] == "PLAIN"].iloc[0]
+    overhead = summary.copy()
+    metric_cols = [c for c in overhead.columns if c not in ["config"]]
+    for c in metric_cols:
+        overhead[c] = overhead[c] - base[c]
+    overhead.insert(1, "baseline", "PLAIN")
+
     print("\n=== RAW RESULTS ===")
     print(df)
 
     print("\n=== SUMMARY (MEAN) ===")
     print(summary)
 
+    print("\n=== OVERHEAD vs PLAIN (MEAN DIFF) ===")
+    print(overhead)
+
     df.to_csv("mongodb_perf_raw.csv", index=False)
     summary.to_csv("mongodb_perf_summary.csv", index=False)
-    print("\nSaved: mongodb_perf_raw.csv, mongodb_perf_summary.csv")
+    overhead.to_csv("mongodb_perf_overhead_vs_plain.csv", index=False)
+    print("\nSaved: mongodb_perf_raw.csv, mongodb_perf_summary.csv, mongodb_perf_overhead_vs_plain.csv")
 
 
 if __name__ == "__main__":
